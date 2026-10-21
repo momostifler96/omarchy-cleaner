@@ -55,8 +55,17 @@ User modules are cleaned generically according to `mode`:
 | `trash` | `oc_trash`: move the item to the freedesktop Trash |
 | `report` | never cleaned in bulk; individual removal through `omarchy-cleaner trash` |
 
-All three removal helpers call `oc_path_allowed`. It accepts only absolute
-paths inside `$HOME` (or a mounted drive's `.Trash-UID`), and it rejects `..`,
+All three removal helpers call `oc_path_allowed` on the item itself. Before
+anything recursive happens, they also check `oc_has_ignored_descendant`:
+
+- `oc_empty_dir` and `oc_delete` walk the tree with `oc_prune_tree`. It
+  removes whole entries that hold no excluded path and descends into those
+  that do.
+- `oc_trash` refuses a folder that holds an excluded path.
+
+`oc_reclaimable_bytes` subtracts the protected parts from scan sizes.
+
+`oc_path_allowed` itself accepts only absolute paths inside `$HOME` (or a mounted drive's `.Trash-UID`), and it rejects `..`,
 `$HOME` itself, the top-level XDG directories, the plugin's own config, and
 anything on the ignore list. `rm` always runs with `--one-file-system`.
 

@@ -491,8 +491,13 @@ cmd_ignore() {
       ;;
     add | remove)
       [[ -n $path ]] || oc_die "usage: omarchy-cleaner ignore $action PATH" 2
-      [[ $path == /* || $path == "~"* ]] || path="$(pwd)/$path"
+      # Globs are stored as written (e.g. "*/myapp/*.keep"); plain relative
+      # paths are made absolute.
+      if ! oc_is_glob "$path"; then
+        [[ $path == /* || $path == "~"* ]] || path="$(pwd)/$path"
+      fi
       path=${path/#\~/$HOME}
+      path=${path%/}
       if [[ $action == add ]]; then
         oc_config_write '.ignore = ((.ignore // []) + [$p] | unique)' --arg p "$path"
       else

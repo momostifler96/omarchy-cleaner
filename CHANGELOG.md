@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-10-21
+
+### Fixed
+- **Ignore list: excluded paths nested inside a cleaned folder were deleted.**
+  Example: ignoring `~/.cache/myapp/keep` while cleaning `user-cache`. The
+  exclusion was checked only on the item being cleaned (`~/.cache/myapp`), and
+  then all its children were removed recursively. Cleaning now prunes around
+  excluded paths at any depth: they and their parent folders stay, the rest is
+  removed. Moving a folder that contains an excluded path to Trash is refused.
+  Scan sizes no longer count protected data. Reported by the marketplace
+  reviewers.
+- `ignore add` stored glob entries as paths relative to the current
+  directory; globs are now stored as written.
+
+### Added
+- Regression tests for nested, deeply nested and glob exclusions, for
+  `oc_delete` pruning and for the Trash refusal.
+
 ## [0.2.0] — 2026-10-21
 
 ### Added

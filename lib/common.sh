@@ -108,23 +108,93 @@ oc_config_write() {
   mv -f "$tmp" "$OC_CONFIG_FILE"
 }
 
-# Prints one ignore-list entry per line (absolute paths or globs, ~ expanded).
+# Prints one ignore-list entry per line (absolute paths or globs, ~ expanded,
+# trailing slashes removed).
 oc_ignore_list() {
   [[ -f $OC_CONFIG_FILE ]] || return 0
-  jq -r '.ignore // [] | .[]' "$OC_CONFIG_FILE" 2>/dev/null | sed "s|^~|$HOME|"
+  jq -r '.ignore // [] | .[]' "$OC_CONFIG_FILE" 2>/dev/null | sed -e "s|^~|$HOME|" -e 's|/*$||' | grep -v '^$' || true
 }
 
-# True when a path is covered by the ignore list (prefix or glob match).
+# The ignore list is read once per process; deletion walks consult it often.
+OC_IGNORE=()
+OC_IGNORE_LOADED=0
+oc_ignore_load() {
+  ((OC_IGNORE_LOADED == 1)) && return 0
+  mapfile -t OC_IGNORE < <(oc_ignore_list)
+  OC_IGNORE_LOADED=1
+}
+
+oc_is_glob() { [[ $1 == *[\*?[]* ]]; }
+
+# True when a path is covered by the ignore list: equal to an entry, inside
+# an entry, or matching an entry used as a glob.
 oc_is_ignored() {
   local path=$1 entry
-  while IFS= read -r entry; do
-    [[ -z $entry ]] && continue
+  oc_ignore_load
+  for entry in "${OC_IGNORE[@]}"; do
     # shellcheck disable=SC2053 # glob matching is intended
     if [[ $path == "$entry" || $path == "$entry"/* || $path == $entry ]]; then
       return 0
     fi
-  done < <(oc_ignore_list)
+  done
   return 1
+}
+
+# True when something inside the directory $1 is covered by the ignore list,
+# i.e. removing $1 recursively would also remove an excluded path. Literal
+# entries are compared as paths; glob entries are searched for with find
+# (whose -path glob, like [[ == ]], lets * match across "/").
+oc_has_ignored_descendant() {
+  local dir=$1 entry
+  oc_ignore_load
+  ((${#OC_IGNORE[@]} > 0)) || return 1
+  [[ -d $dir && ! -L $dir ]] || return 1
+  for entry in "${OC_IGNORE[@]}"; do
+    if oc_is_glob "$entry"; then
+      [[ -n $(find "$dir" -xdev -mindepth 1 -path "$entry" -print -quit 2>/dev/null) ]] && return 0
+    elif [[ $entry == "$dir"/* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Remove everything inside $1 except ignored paths. Entries that contain an
+# ignored path are descended into instead of being removed wholesale, so an
+# exclusion deep inside a cache folder survives along with its parents.
+oc_prune_tree() {
+  local dir=$1 child failed=0
+  while IFS= read -r -d '' child; do
+    if oc_is_ignored "$child"; then
+      continue
+    elif oc_has_ignored_descendant "$child"; then
+      oc_prune_tree "$child" || failed=1
+    else
+      rm -rf --one-file-system -- "$child" 2>/dev/null || failed=1
+    fi
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+  return "$failed"
+}
+
+# Apparent size of a path minus whatever the ignore list protects inside it,
+# so scans report what a clean would actually free.
+oc_reclaimable_bytes() {
+  local path=$1 total protected=0 entry match
+  total=$(oc_path_bytes "$path")
+  if oc_has_ignored_descendant "$path"; then
+    for entry in "${OC_IGNORE[@]}"; do
+      if oc_is_glob "$entry"; then
+        while IFS= read -r -d '' match; do
+          # Count each protected match once (skip ones inside another match).
+          [[ -n $match ]] && protected=$((protected + $(oc_path_bytes "$match")))
+        done < <(find "$path" -xdev -mindepth 1 -path "$entry" -prune -print0 2>/dev/null)
+      elif [[ $entry == "$path"/* && -e $entry ]]; then
+        protected=$((protected + $(oc_path_bytes "$entry")))
+      fi
+    done
+  fi
+  total=$((total - protected))
+  echo $((total > 0 ? total : 0))
 }
 
 # ---------------------------------------------------------------------------
@@ -146,22 +216,29 @@ oc_path_allowed() {
 }
 
 # Remove the contents of a directory but keep the directory itself (and its
-# permissions), so applications that hold it open keep working.
+# permissions), so applications that hold it open keep working. Ignored paths
+# anywhere inside are kept (see oc_prune_tree).
 oc_empty_dir() {
   local dir=$1
   oc_path_allowed "$dir" || { oc_warn "refused (protected path): $dir"; return 1; }
   [[ -d $dir && ! -L $dir ]] || return 0
-  find "$dir" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null || {
+  oc_prune_tree "$dir" || {
     oc_warn "some entries could not be removed in $dir"
     return 1
   }
 }
 
 # Remove a file or a whole directory tree. Symlinks are removed, never followed.
+# A directory that contains an ignored path is pruned instead: everything
+# else goes, the excluded path and its parent folders stay.
 oc_delete() {
   local p=$1
   oc_path_allowed "$p" || { oc_warn "refused (protected path): $p"; return 1; }
   [[ -e $p || -L $p ]] || return 0
+  if oc_has_ignored_descendant "$p"; then
+    oc_prune_tree "$p" || { oc_warn "some entries could not be removed in $p"; return 1; }
+    return 0
+  fi
   rm -rf --one-file-system -- "$p" 2>/dev/null || { oc_warn "could not remove $p"; return 1; }
 }
 
@@ -171,6 +248,11 @@ oc_trash() {
   local p=$1
   oc_path_allowed "$p" || { oc_warn "refused (protected path): $p"; return 1; }
   [[ -e $p || -L $p ]] || return 0
+  # Moving a folder would carry an excluded path along with it; refuse.
+  if oc_has_ignored_descendant "$p"; then
+    oc_warn "refused: $p contains a path from your ignore list"
+    return 1
+  fi
   if command -v gio >/dev/null 2>&1 && gio trash -- "$p" 2>/dev/null; then
     return 0
   fi
@@ -207,7 +289,7 @@ oc_emit_path() {
   local path=$1 label=${2:-$(basename -- "$1")} bytes
   [[ -e $path ]] || return 0
   oc_is_ignored "$path" && return 0
-  bytes=$(oc_path_bytes "$path")
+  bytes=$(oc_reclaimable_bytes "$path")
   ((bytes > 0)) || return 0
   oc_emit "$bytes" "$path" "$label"
 }

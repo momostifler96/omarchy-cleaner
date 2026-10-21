@@ -142,6 +142,44 @@ cli ignore list | grep -qx "$HOME/.cache/keepme" && ok "ignore add/list" || ko "
 cli ignore remove "$HOME/.cache/keepme" >/dev/null
 cli ignore list | grep -q keepme && ko "ignore remove" || ok "ignore remove"
 
+echo "==> Ignore list: excluded paths nested inside cleaned folders"
+new_home
+# Exact scenario reported in review: ignoring ~/.cache/myapp/keep must protect
+# it even though ~/.cache/myapp itself is cleaned.
+mkfile "$HOME/.cache/myapp/keep/important.db" 16
+mkfile "$HOME/.cache/myapp/drop/blob" 16
+mkfile "$HOME/.cache/myapp/top-level-file" 16
+mkfile "$HOME/.cache/deep/a/b/c/keepme.txt" 4
+mkfile "$HOME/.cache/deep/a/b/c/dropme.txt" 4
+mkfile "$HOME/.cache/deep/a/other/x" 4
+mkfile "$HOME/.cache/globapp/data/session.keep" 4
+mkfile "$HOME/.cache/globapp/data/session.tmp" 4
+cli ignore add "$HOME/.cache/myapp/keep" >/dev/null
+cli ignore add "$HOME/.cache/deep/a/b/c/keepme.txt" >/dev/null
+cli ignore add "*/globapp/*.keep" >/dev/null
+scan=$(cli scan user-cache --json --details)
+myapp_bytes=$(jq '.modules[0].items[] | select(.label == "myapp") | .bytes' <<<"$scan")
+[[ -n $myapp_bytes ]] && ((myapp_bytes <= 40000)) &&
+  ok "scan excludes protected sub-paths from the reclaimable size" || ko "scan excludes protected sub-paths from the reclaimable size" "myapp=$myapp_bytes"
+"$CLI" clean user-cache --yes >/dev/null 2>&1
+[[ -f $HOME/.cache/myapp/keep/important.db ]] && ok "ignored sub-folder survives (review scenario)" || ko "ignored sub-folder survives (review scenario)"
+[[ ! -e $HOME/.cache/myapp/drop && ! -e $HOME/.cache/myapp/top-level-file ]] && ok "siblings of the ignored sub-folder are cleaned" || ko "siblings of the ignored sub-folder are cleaned"
+[[ -f $HOME/.cache/deep/a/b/c/keepme.txt && ! -e $HOME/.cache/deep/a/b/c/dropme.txt && ! -e $HOME/.cache/deep/a/other ]] &&
+  ok "deeply nested ignored file survives, the rest is cleaned" || ko "deeply nested ignored file survives, the rest is cleaned"
+[[ -f $HOME/.cache/globapp/data/session.keep && ! -e $HOME/.cache/globapp/data/session.tmp ]] &&
+  ok "glob ignore entries protect matching files inside cleaned folders" || ko "glob ignore entries protect matching files inside cleaned folders"
+
+# oc_delete prunes instead of removing a tree that holds an excluded path;
+# oc_trash refuses to move such a tree.
+mkfile "$HOME/Projects/old/keep.txt" 4
+mkfile "$HOME/Projects/old/junk.txt" 4
+cli ignore add "$HOME/Projects/old/keep.txt" >/dev/null
+( source "$REPO/lib/common.sh"; oc_delete "$HOME/Projects/old" ) 2>/dev/null
+[[ -f $HOME/Projects/old/keep.txt && ! -e $HOME/Projects/old/junk.txt ]] && ok "oc_delete keeps ignored descendants" || ko "oc_delete keeps ignored descendants"
+mkfile "$HOME/Projects/old/junk2.txt" 4
+"$CLI" trash "$HOME/Projects/old" --yes >/dev/null 2>&1
+[[ -f $HOME/Projects/old/keep.txt && -f $HOME/Projects/old/junk2.txt ]] && ok "trash refuses a folder that contains an ignored path" || ko "trash refuses a folder that contains an ignored path"
+
 echo "==> Trash"
 new_home
 mkfile "$HOME/.local/share/Trash/files/old.txt" 16

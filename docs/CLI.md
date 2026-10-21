@@ -190,8 +190,15 @@ Static catalogues: id, title, description, kind/root, default selection, risk an
 
 ### `ignore list | add PATH | remove PATH`
 
-Manages the ignore list. Entries are absolute paths (`~` allowed) or globs.
+Manages the ignore list. Entries are absolute paths (`~` allowed) or globs
+(stored as written, e.g. `'*/myapp/*.keep'`). In a glob, `*` also matches `/`.
 A path matches when it is equal to an entry, below it, or matches it as a glob.
+
+The protection also covers paths nested inside what a module cleans. When a
+cleaned folder contains an excluded path, the folder is pruned around it
+rather than removed: everything else is deleted, and the excluded path and its
+parents stay. Scan sizes leave out the protected parts. `trash` refuses to move
+a folder that contains an excluded path.
 
 ### `config list | get KEY | set KEY VALUE | unset KEY`
 

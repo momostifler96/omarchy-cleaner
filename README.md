@@ -129,7 +129,7 @@ The pre-selection is a default. Change it permanently with `omarchy-cleaner conf
 - Anything outside your home folder, except through the fixed root actions above.
 - Your home folder itself and the top-level `~/.config`, `~/.local/share` and `~/.cache` folders. Cache folders are emptied, never deleted.
 - `~/.cache/omarchy`, `~/.cache/quickshell`, and cache entries named `*.bak`, `*.backup`, `*.orig` or `*.old`.
-- Every path in your ignore list: `omarchy-cleaner ignore add PATH`.
+- Every path in your ignore list (`omarchy-cleaner ignore add PATH`), **including paths deep inside a folder being cleaned**. The folder is pruned around them: everything else goes, while the excluded path and its parent folders stay. A folder that contains an excluded path is never moved to Trash as a whole. Glob entries such as `*/myapp/*.keep` are supported.
 - Symlinks are removed, never followed. Removal never crosses filesystems.
 
 ## Remote control
