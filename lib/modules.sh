@@ -50,6 +50,7 @@ OC_TASKS=(
   "dns-flush|Flush DNS cache|Clear systemd-resolved's DNS cache.|root"
   "trim|Trim SSDs|Tell SSDs which blocks are free (fstrim on all mounted filesystems).|root"
   "locate-db|Update file search index|Rebuild the plocate database used by file search.|root"
+  "drop-caches|Drop file cache|Empty the kernel's file cache. Rarely useful: Linux frees it on demand, and the system is slower until it refills.|root"
 )
 
 # Directory names inside ~/.cache claimed by a more specific module, so the

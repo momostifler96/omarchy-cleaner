@@ -15,6 +15,7 @@
 #   dns-flush             resolvectl flush-caches
 #   trim                  fstrim --all --verbose
 #   locate-db             updatedb
+#   drop-caches           sync, then echo 3 > /proc/sys/vm/drop_caches
 #
 # Usage: pkexec omarchy-cleaner-root <verb> [arg] [<verb> [arg] ...]
 # Output: one JSON object per verb on stdout: {"verb":…,"ok":…,"message":…}
@@ -73,6 +74,14 @@ run_verb() {
     locate-db)
       out=$(updatedb 2>&1) || status=$?
       ;;
+    drop-caches)
+      local before after
+      before=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
+      sync
+      if ! echo 3 >/proc/sys/vm/drop_caches; then status=1; fi
+      after=$(awk '/^Cached:/ {print $2}' /proc/meminfo)
+      out="file cache $((before / 1024)) MB -> $((after / 1024)) MB"
+      ;;
   esac
   if ((status == 0)); then
     result "$verb" true "${out:-done}"
@@ -93,7 +102,7 @@ while ((i < ${#args[@]})); do
       number_arg "${args[i + 1]:-}"
       i=$((i + 2))
       ;;
-    coredumps | orphans | snapper | dns-flush | trim | locate-db)
+    coredumps | orphans | snapper | dns-flush | trim | locate-db | drop-caches)
       i=$((i + 1))
       ;;
     *)

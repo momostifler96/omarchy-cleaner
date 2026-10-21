@@ -18,6 +18,7 @@ import qs.Ui
 //   omarchy-shell io.github.momostifler96.omarchy-cleaner scan
 //   omarchy-shell io.github.momostifler96.omarchy-cleaner cleanDefaults
 //   omarchy-shell io.github.momostifler96.omarchy-cleaner status
+//   omarchy-shell io.github.momostifler96.omarchy-cleaner showMemory | showDisk
 Panel {
   id: root
   moduleName: "io.github.momostifler96.omarchy-cleaner"
@@ -44,6 +45,14 @@ Panel {
   property string statusText: ""
   property string errorText: ""
   property bool confirmOpen: false
+  property string confirmMessage: ""
+  property string confirmLabel: "Confirm"
+  property var confirmAction: null
+
+  // "disk" or "memory"
+  property string tab: "disk"
+  property var memory: null            // parsed `omarchy-cleaner memory --json`
+  property var memExpanded: ({})       // unit -> bool
 
   readonly property bool busy: scanning || cleaning || maintaining
   readonly property var modules: scan && scan.modules ? scan.modules : []
@@ -52,8 +61,14 @@ Panel {
     { id: "desktop-db", title: "Launchers" },
     { id: "dns-flush", title: "DNS cache" },
     { id: "trim", title: "Trim SSD" },
-    { id: "locate-db", title: "Search index" }
+    { id: "locate-db", title: "Search index" },
+    { id: "drop-caches", title: "Drop file cache" }
   ]
+  readonly property var memoryApps: memory && memory.apps ? memory.apps : []
+  readonly property var stuckProcesses: memory && memory.stuck ? memory.stuck : []
+  readonly property real ramFraction: memory ? memory.ram.usedBytes / Math.max(1, memory.ram.totalBytes) : 0
+  readonly property real cacheFraction: memory ? memory.ram.cacheBytes / Math.max(1, memory.ram.totalBytes) : 0
+  readonly property real swapFraction: memory && memory.swap.totalBytes > 0 ? memory.swap.usedBytes / memory.swap.totalBytes : 0
 
   readonly property var pickedIds: {
     var out = []
@@ -133,9 +148,66 @@ Panel {
     scanProc.running = true
   }
 
+  // Ask before any destructive action; `action` runs on confirm.
+  function askConfirm(message, label, action) {
+    confirmMessage = message
+    confirmLabel = label
+    confirmAction = action
+    confirmOpen = true
+  }
+
+  function confirmNow() {
+    var action = confirmAction
+    confirmOpen = false
+    confirmAction = null
+    if (typeof action === "function") action()
+  }
+
   function requestClean() {
     if (busy || pickedIds.length === 0) return
-    confirmOpen = true
+    var ids = pickedIds.slice()
+    askConfirm("Clean " + ids.length + " categor" + (ids.length > 1 ? "ies" : "y")
+      + " (about " + humanBytes(pickedBytes) + ")?"
+      + (pickedNeedsRoot ? "\nSystem items will ask for your password." : ""),
+      "Clean", function() { root.runClean(ids) })
+  }
+
+  function refreshMemory() {
+    if (!memProc.running) {
+      memProc.command = [cliPath, "memory", "--json", "--quiet", "--limit", "12"]
+      memProc.running = true
+    }
+  }
+
+  function quitApp(app, force) {
+    if (busy || !app || !app.quittable) return
+    askConfirm((force ? "Force quit " : "Quit ") + app.name + " (" + humanBytes(app.bytes) + ", "
+      + app.processCount + " process" + (app.processCount > 1 ? "es" : "") + ")?\nUnsaved work may be lost.",
+      force ? "Force quit" : "Quit", function() {
+        root.runMemoryAction(["memory", "quit", app.unit].concat(force ? ["--force"] : []), "Quitting " + app.name + "…")
+      })
+  }
+
+  function quitProcess(proc, force) {
+    if (busy || !proc || !proc.quittable) return
+    askConfirm((force ? "Force quit " : "Quit ") + proc.comm + " (PID " + proc.pid + ")?\nUnsaved work may be lost.",
+      force ? "Force quit" : "Quit", function() {
+        root.runMemoryAction(["memory", "kill", String(proc.pid)].concat(force ? ["--force"] : []), "Quitting " + proc.comm + "…")
+      })
+  }
+
+  function runMemoryAction(args, label) {
+    errorText = ""
+    statusText = label
+    maintaining = true
+    taskProc.command = [cliPath].concat(args).concat(["--yes", "--json", "--quiet"])
+    taskProc.running = true
+  }
+
+  function toggleMemExpanded(unit) {
+    var next = Object.assign({}, memExpanded)
+    next[unit] = !memExpanded[unit]
+    memExpanded = next
   }
 
   function runClean(ids) {
@@ -150,6 +222,12 @@ Panel {
 
   function runTask(id) {
     if (busy) return
+    if (id === "drop-caches" && confirmAction === null && !confirmOpen) {
+      askConfirm("Drop the kernel file cache?\nLinux already frees it on demand; the system is slower until it refills.",
+        "Drop cache", function() { root.runTask("drop-caches!") })
+      return
+    }
+    if (id === "drop-caches!") id = "drop-caches"
     errorText = ""
     statusText = "Running " + id + "…"
     maintaining = true
@@ -186,6 +264,8 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function scan(): void { root.runScan() }
+    function showMemory(): void { root.tab = "memory"; root.open() }
+    function showDisk(): void { root.tab = "disk"; root.open() }
     function cleanDefaults(): void {
       var ids = []
       for (var i = 0; i < root.modules.length; i++) {
@@ -265,12 +345,33 @@ Panel {
     }
     onExited: function(exitCode) {
       root.maintaining = false
+      if (root.tab === "memory") root.refreshMemory()
       if (exitCode !== 0 && root.errorText === "") root.errorText = "Action failed (exit " + exitCode + ")"
       statusClear.restart()
     }
   }
 
   Timer { id: statusClear; interval: 6000; onTriggered: if (!root.busy) root.statusText = "" }
+
+  Process {
+    id: memProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var result = root.parseResult(text, null)
+        if (result && result.ram) root.memory = result
+      }
+    }
+  }
+
+  // Live memory figures while the Memory tab is visible.
+  Timer {
+    interval: 3000
+    running: root.opened && root.tab === "memory"
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refreshMemory()
+  }
 
   // Background scan: only when the cached scan is older than the interval.
   Timer {
@@ -284,7 +385,7 @@ Panel {
     }
   }
 
-  onOpenedChanged: if (opened) { confirmOpen = false; errorText = ""; if (!scan) runScan() }
+  onOpenedChanged: if (opened) { confirmOpen = false; confirmAction = null; errorText = ""; if (!scan) runScan() }
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -322,7 +423,8 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
       onCloseRequested: root.confirmOpen ? (root.confirmOpen = false) : root.close()
-      onActivateRequested: if (root.confirmOpen) root.runClean(root.pickedIds)
+      onMoveRequested: function(dx, dy) { if (dx !== 0 && !root.confirmOpen) root.tab = root.tab === "disk" ? "memory" : "disk" }
+      onActivateRequested: if (root.confirmOpen) root.confirmNow()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       Column {
@@ -370,7 +472,9 @@ Panel {
             Text {
               textFormat: Text.PlainText
               text: (root.busy ? root.statusText
-                : (root.scan ? "Scanned " + root.ago(root.scan.generatedAt) + " · " + root.humanBytes(root.scan.totalBytes) + " found" : "Not scanned yet")).toUpperCase()
+                : root.tab === "memory"
+                  ? (root.memory ? "RAM " + Math.round(root.ramFraction * 100) + "% · available now" : "Reading memory…")
+                  : (root.scan ? "Scanned " + root.ago(root.scan.generatedAt) + " · " + root.humanBytes(root.scan.totalBytes) + " found" : "Not scanned yet")).toUpperCase()
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption
@@ -384,7 +488,9 @@ Panel {
           Text {
             id: heroSize
             textFormat: Text.PlainText
-            text: root.scan ? root.humanBytes(root.pickedBytes) : "—"
+            text: root.tab === "memory"
+              ? (root.memory ? root.humanBytes(root.memory.ram.availableBytes) : "—")
+              : (root.scan ? root.humanBytes(root.pickedBytes) : "—")
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.displayLarge
@@ -393,6 +499,36 @@ Panel {
             anchors.verticalCenter: parent.verticalCenter
           }
         }
+
+        // ---------- Tabs ----------
+        Row {
+          id: tabRow
+          width: parent.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: [ { id: "disk", title: "Disk", icon: "\uf0a0" }, { id: "memory", title: "Memory", icon: "\uf2db" } ]
+
+            Button {
+              required property var modelData
+              width: (tabRow.width - tabRow.spacing) / 2
+              text: modelData.title
+              iconText: modelData.icon
+              bordered: true
+              active: root.tab === modelData.id
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              fontSize: Style.font.bodySmall
+              onClicked: root.tab = modelData.id
+            }
+          }
+        }
+
+        Column {
+          id: diskView
+          visible: root.tab === "disk"
+          width: parent.width
+          spacing: Style.space(12)
 
         // ---------- Modules ----------
         PanelSeparator { foreground: root.bar.foreground }
@@ -668,6 +804,375 @@ Panel {
           }
         }
 
+        }
+
+        // ---------- Memory view ----------
+        Column {
+          id: memoryView
+          visible: root.tab === "memory"
+          width: parent.width
+          spacing: Style.space(10)
+
+          // RAM gauge: used (solid) with the reclaimable file cache shown
+          // separately (faint), because Linux frees it on demand.
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+
+            Item {
+              width: parent.width
+              implicitHeight: ramLabel.implicitHeight
+              Text {
+                id: ramLabel
+                textFormat: Text.PlainText
+                text: "RAM"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+              Text {
+                anchors.right: parent.right
+                textFormat: Text.PlainText
+                text: root.memory ? root.humanBytes(root.memory.ram.usedBytes) + " used · "
+                  + root.humanBytes(root.memory.ram.cacheBytes) + " cache · " + root.humanBytes(root.memory.ram.totalBytes) : ""
+                color: root.bar.foreground
+                opacity: 0.7
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(8)
+              Rectangle {
+                id: ramTrack
+                anchors.fill: parent
+                radius: height / 2
+                color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.12)
+              }
+              Rectangle {
+                anchors.left: ramTrack.left
+                anchors.verticalCenter: ramTrack.verticalCenter
+                height: ramTrack.height
+                radius: ramTrack.radius
+                color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.3)
+                width: Math.min(ramTrack.width, ramTrack.width * (root.ramFraction + root.cacheFraction))
+                Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+              }
+              Rectangle {
+                anchors.left: ramTrack.left
+                anchors.verticalCenter: ramTrack.verticalCenter
+                height: ramTrack.height
+                radius: ramTrack.radius
+                color: root.ramFraction > 0.9 ? root.bar.urgent : root.bar.foreground
+                width: Math.max(ramTrack.height, ramTrack.width * root.ramFraction)
+                Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+              }
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: swapLabel.implicitHeight
+              visible: root.memory && root.memory.swap.totalBytes > 0
+              Text {
+                id: swapLabel
+                textFormat: Text.PlainText
+                text: "Swap"
+                color: root.bar.foreground
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+              Text {
+                anchors.right: parent.right
+                textFormat: Text.PlainText
+                text: root.memory ? root.humanBytes(root.memory.swap.usedBytes) + " / " + root.humanBytes(root.memory.swap.totalBytes) : ""
+                color: root.bar.foreground
+                opacity: 0.7
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(6)
+              visible: root.memory && root.memory.swap.totalBytes > 0
+              Rectangle {
+                id: swapTrack
+                anchors.fill: parent
+                radius: height / 2
+                color: Qt.rgba(root.bar.foreground.r, root.bar.foreground.g, root.bar.foreground.b, 0.12)
+              }
+              Rectangle {
+                anchors.left: swapTrack.left
+                anchors.verticalCenter: swapTrack.verticalCenter
+                height: swapTrack.height
+                radius: swapTrack.radius
+                color: root.bar.foreground
+                opacity: 0.7
+                width: Math.max(swapTrack.height, swapTrack.width * root.swapFraction)
+              }
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "The file cache is not wasted memory: Linux gives it back instantly when an app needs it. To really free RAM, quit what uses it."
+              color: root.bar.foreground
+              opacity: 0.55
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+          }
+
+          PanelSeparator { foreground: root.bar.foreground }
+
+          PanelSectionHeader {
+            text: "APPLICATIONS"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+          }
+
+          Flickable {
+            id: appScroll
+            width: parent.width
+            height: Math.min(appList.implicitHeight, Style.space(380))
+            contentHeight: appList.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+              id: appList
+              width: appScroll.width
+              spacing: Style.space(2)
+
+              Repeater {
+                model: root.memoryApps
+
+                Column {
+                  id: appRow
+                  required property var modelData
+                  width: appList.width
+                  spacing: Style.space(2)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: Math.max(appText.implicitHeight, Style.space(26)) + Style.space(4)
+
+                    Column {
+                      id: appText
+                      anchors.left: parent.left
+                      anchors.right: appSize.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(1)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        text: appRow.modelData.name
+                        color: root.bar.foreground
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                        font.bold: true
+                        elide: Text.ElideRight
+                        width: parent.width
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        text: appRow.modelData.processCount + " process" + (appRow.modelData.processCount > 1 ? "es" : "")
+                          + (appRow.modelData.quittable ? "" : " · " + appRow.modelData.reason)
+                        color: root.bar.foreground
+                        opacity: 0.6
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        elide: Text.ElideRight
+                        width: parent.width
+                      }
+                    }
+
+                    Text {
+                      id: appSize
+                      textFormat: Text.PlainText
+                      anchors.right: appActions.left
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.humanBytes(appRow.modelData.bytes)
+                      color: root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    MouseArea {
+                      anchors.left: parent.left
+                      anchors.right: appActions.left
+                      anchors.top: parent.top
+                      anchors.bottom: parent.bottom
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.toggleMemExpanded(appRow.modelData.unit)
+                    }
+
+                    Row {
+                      id: appActions
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(2)
+
+                      PanelActionButton {
+                        visible: appRow.modelData.quittable
+                        iconText: "\uf00d"
+                        tooltipText: "Quit (lets the app save and exit)"
+                        foreground: root.bar.foreground
+                        fontFamily: root.bar.fontFamily
+                        fontSize: Style.font.bodySmall
+                        enabled: !root.busy
+                        onClicked: root.quitApp(appRow.modelData, false)
+                      }
+                      PanelActionButton {
+                        visible: appRow.modelData.quittable
+                        iconText: "\uf0e7"
+                        tooltipText: "Force quit (SIGKILL)"
+                        foreground: root.bar.foreground
+                        fontFamily: root.bar.fontFamily
+                        fontSize: Style.font.bodySmall
+                        enabled: !root.busy
+                        onClicked: root.quitApp(appRow.modelData, true)
+                      }
+                    }
+                  }
+
+                  // Heaviest processes of the app, quittable one by one
+                  // (useful for commands running inside a terminal).
+                  Column {
+                    visible: root.memExpanded[appRow.modelData.unit] === true
+                    width: parent.width - Style.space(16)
+                    x: Style.space(16)
+                    spacing: Style.space(1)
+
+                    Repeater {
+                      model: appRow.modelData.processes
+
+                      Item {
+                        required property var modelData
+                        width: parent.width
+                        implicitHeight: Style.space(22)
+
+                        Text {
+                          anchors.left: parent.left
+                          anchors.right: procSize.left
+                          anchors.rightMargin: Style.space(6)
+                          anchors.verticalCenter: parent.verticalCenter
+                          textFormat: Text.PlainText
+                          text: modelData.comm + "  ·  " + modelData.pid
+                          color: root.bar.foreground
+                          opacity: 0.75
+                          font.family: root.bar.fontFamily
+                          font.pixelSize: Style.font.caption
+                          elide: Text.ElideRight
+                        }
+                        Text {
+                          id: procSize
+                          anchors.right: procQuit.left
+                          anchors.rightMargin: Style.space(6)
+                          anchors.verticalCenter: parent.verticalCenter
+                          textFormat: Text.PlainText
+                          text: root.humanBytes(modelData.bytes)
+                          color: root.bar.foreground
+                          opacity: 0.75
+                          font.family: root.bar.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+                        PanelActionButton {
+                          id: procQuit
+                          anchors.right: parent.right
+                          anchors.verticalCenter: parent.verticalCenter
+                          visible: modelData.quittable
+                          iconText: "\uf00d"
+                          tooltipText: "Quit this process"
+                          foreground: root.bar.foreground
+                          fontFamily: root.bar.fontFamily
+                          fontSize: Style.font.caption
+                          enabled: !root.busy
+                          onClicked: root.quitProcess(modelData, false)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Stuck processes: stopped ones can be killed; D-state and zombies
+          // are explained, since no signal can remove them.
+          Column {
+            visible: root.stuckProcesses.length > 0
+            width: parent.width
+            spacing: Style.space(4)
+
+            PanelSeparator { foreground: root.bar.foreground }
+
+            PanelSectionHeader {
+              text: "STUCK PROCESSES"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Repeater {
+              model: root.stuckProcesses
+
+              Item {
+                required property var modelData
+                width: parent.width
+                implicitHeight: Math.max(stuckText.implicitHeight, Style.space(24))
+
+                Column {
+                  id: stuckText
+                  anchors.left: parent.left
+                  anchors.right: stuckKill.left
+                  anchors.rightMargin: Style.space(6)
+                  anchors.verticalCenter: parent.verticalCenter
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.comm + "  ·  " + modelData.pid
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                    width: parent.width
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.stateLabel
+                    color: root.bar.foreground
+                    opacity: 0.6
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                    width: parent.width
+                  }
+                }
+                PanelActionButton {
+                  id: stuckKill
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: modelData.canKill
+                  iconText: "\uf0e7"
+                  tooltipText: "Force quit"
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  fontSize: Style.font.bodySmall
+                  enabled: !root.busy
+                  onClicked: root.quitProcess({ pid: modelData.pid, comm: modelData.comm, quittable: true }, true)
+                }
+              }
+            }
+          }
+        }
+
         Text {
           visible: root.errorText !== "" || (root.statusText !== "" && !root.busy)
           width: parent.width
@@ -683,14 +1188,12 @@ Panel {
       ConfirmDialog {
         anchors.fill: parent
         opened: root.confirmOpen
-        message: "Clean " + root.pickedIds.length + " categor" + (root.pickedIds.length > 1 ? "ies" : "y")
-          + " (about " + root.humanBytes(root.pickedBytes) + ")?"
-          + (root.pickedNeedsRoot ? "\nSystem items will ask for your password." : "")
-        confirmText: "Clean"
+        message: root.confirmMessage
+        confirmText: root.confirmLabel
         foreground: root.bar.foreground
         fontFamily: root.bar.fontFamily
-        onCanceled: root.confirmOpen = false
-        onConfirmed: root.runClean(root.pickedIds)
+        onCanceled: { root.confirmOpen = false; root.confirmAction = null }
+        onConfirmed: root.confirmNow()
       }
     }
   }

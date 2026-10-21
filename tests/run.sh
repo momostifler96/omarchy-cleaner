@@ -19,6 +19,7 @@ VERBOSE=0
 
 PASS=0
 FAIL=0
+REAL_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}
 SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-cleaner-test.XXXXXX")
 trap 'rm -rf "$SANDBOX"' EXIT
 
@@ -65,7 +66,7 @@ echo "==> CLI basics"
 new_home
 [[ $(cli version) == "$(jq -r .version "$REPO/manifest.json")" ]] && ok "version matches manifest" || ko "version matches manifest"
 cli modules --json | jq -e 'length == 13 and all(has("id") and has("risk"))' >/dev/null && ok "modules --json" || ko "modules --json"
-cli tasks --json | jq -e 'length == 5' >/dev/null && ok "tasks --json" || ko "tasks --json"
+cli tasks --json | jq -e 'length == 6' >/dev/null && ok "tasks --json" || ko "tasks --json"
 "$CLI" scan nope >/dev/null 2>&1; [[ $? == 2 ]] && ok "unknown module exits 2" || ko "unknown module exits 2"
 "$CLI" frobnicate >/dev/null 2>&1; [[ $? == 2 ]] && ok "unknown command exits 2" || ko "unknown command exits 2"
 cli status --json | jq -e '.scanned == false' >/dev/null && ok "status before any scan" || ko "status before any scan"
@@ -176,6 +177,41 @@ cli config set journalMaxMB 300 >/dev/null && [[ $(cli config get journalMaxMB) 
 cli config set selection '["trash"]' >/dev/null
 "$CLI" clean --defaults --dry-run --json 2>/dev/null | jq -e '[.modules[].id] == ["trash"] or (.modules | length) == 0' >/dev/null &&
   ok "--defaults honours saved selection" || ko "--defaults honours saved selection"
+
+echo "==> Memory"
+mem=$(cli memory --json)
+jq -e '.ok and .ram.totalBytes > 0 and .ram.availableBytes > 0 and (.apps | type == "array") and (.stuck | type == "array")' <<<"$mem" >/dev/null &&
+  ok "memory --json reports RAM, apps and stuck processes" || ko "memory --json reports RAM, apps and stuck processes" "$mem"
+jq -e 'all(.apps[]; has("unit") and has("quittable") and (.bytes >= 0))' <<<"$mem" >/dev/null &&
+  ok "memory apps carry unit, size and quittable flag" || ko "memory apps carry unit, size and quittable flag"
+"$CLI" memory quit not-an-app.service --yes >/dev/null 2>&1; [[ $? == 2 ]] && ok "memory quit rejects non-app units" || ko "memory quit rejects non-app units"
+"$CLI" memory kill 1 --yes >/dev/null 2>&1; [[ $? == 1 ]] && ok "memory kill refuses other users' processes" || ko "memory kill refuses other users' processes"
+"$CLI" memory kill abc --yes >/dev/null 2>&1; [[ $? == 2 ]] && ok "memory kill rejects invalid PIDs" || ko "memory kill rejects invalid PIDs"
+tail -f /dev/null &
+dummy=$!
+"$CLI" memory kill "$dummy" </dev/null >/dev/null 2>&1; [[ $? == 3 ]] && kill -0 "$dummy" 2>/dev/null &&
+  ok "memory kill needs confirmation" || ko "memory kill needs confirmation"
+"$CLI" memory kill "$dummy" --yes >/dev/null 2>&1
+wait "$dummy" 2>/dev/null
+kill -0 "$dummy" 2>/dev/null && ko "memory kill stops an owned process" || ok "memory kill stops an owned process"
+# The user session bus lives in the real runtime dir, not the sandbox one.
+if [[ -n $REAL_RUNTIME_DIR ]] && command -v systemd-run >/dev/null 2>&1 &&
+  XDG_RUNTIME_DIR=$REAL_RUNTIME_DIR systemctl --user show-environment >/dev/null 2>&1; then
+  unit="app-omarchy-cleaner-test-$RANDOM.scope"
+  XDG_RUNTIME_DIR=$REAL_RUNTIME_DIR systemd-run --user --scope --quiet --unit="$unit" tail -f /dev/null >/dev/null 2>&1 &
+  for _ in $(seq 1 25); do
+    XDG_RUNTIME_DIR=$REAL_RUNTIME_DIR systemctl --user is-active "$unit" >/dev/null 2>&1 && break
+    read -r -t 0.2 <> <(:) || true
+  done
+  if XDG_RUNTIME_DIR=$REAL_RUNTIME_DIR "$CLI" memory quit "$unit" --yes --json 2>/dev/null | jq -e '.ok and .signal == "SIGTERM"' >/dev/null; then
+    ok "memory quit sends SIGTERM to an app scope"
+  else
+    ko "memory quit sends SIGTERM to an app scope"
+  fi
+  XDG_RUNTIME_DIR=$REAL_RUNTIME_DIR systemctl --user kill --signal=SIGKILL "$unit" >/dev/null 2>&1 || true
+else
+  echo "  (no systemd user session, app scope test skipped)"
+fi
 
 echo "==> Root helper"
 "$HELPER" coredumps >/dev/null 2>&1; [[ $? == 1 ]] && ok "helper refuses to run without root" || ko "helper refuses to run without root"

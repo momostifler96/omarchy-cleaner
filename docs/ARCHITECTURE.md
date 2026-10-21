@@ -7,6 +7,7 @@ bin/omarchy-cleaner      CLI: scan, clean, maintain, trash, status, config, sche
 bin/omarchy-cleaner-root privileged helper, run through pkexec, fixed verbs only
 lib/common.sh            logging, config, ignore list, size parsing, guarded deletion
 lib/modules.sh           module + task registry and their scan/clean functions
+lib/memory.sh            RAM/swap, memory per app (PSS by cgroup), stuck processes, quit actions
 tests/run.sh             test suite (fake $HOME, no root)
 docs/                    CLI reference and this document
 ```
@@ -69,6 +70,21 @@ anything on the ignore list. `rm` always runs with `--one-file-system`.
    `oc_verbs_<id>`.
 4. Add a test in `tests/run.sh`, then document the module in `README.md` and
    `CHANGELOG.md`.
+
+## Memory view
+
+`oc_process_table` reads `smaps_rollup`, `cgroup`, `comm` and `stat` for every
+PID in a single gawk pass. `BEGINFILE` skips files it cannot read, which are
+the processes of other users. The jq stage groups processes by cgroup leaf
+(the systemd unit) and derives a display name:
+
+- the unit name for `app-*.scope` and `app-*.service` units, decoded;
+- otherwise, or when the unit is named after a launcher such as `gtk-launch`
+  or `xdg-terminal-exec`, the comm of the group's first process.
+
+Quitting goes through `systemctl --user kill`, so every process of the app gets
+the signal, children included. The unit is re-checked against a fresh listing
+right before the signal is sent.
 
 ## Privileged helper
 

@@ -14,6 +14,8 @@ OC_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
 source "$OC_ROOT/lib/common.sh"
 # shellcheck source=lib/modules.sh
 source "$OC_ROOT/lib/modules.sh"
+# shellcheck source=lib/memory.sh
+source "$OC_ROOT/lib/memory.sh"
 
 OC_HELPER="$OC_ROOT/bin/omarchy-cleaner-root"
 OC_VERSION=$(jq -r '.version' "$OC_ROOT/manifest.json" 2>/dev/null || echo unknown)
@@ -28,6 +30,9 @@ Usage:
   omarchy-cleaner clean (MODULE... | --defaults) [--dry-run] [--yes] [--json]
   omarchy-cleaner maintain TASK... [--yes] [--json]
   omarchy-cleaner trash PATH... [--yes] [--json]
+  omarchy-cleaner memory [--limit N] [--json]
+  omarchy-cleaner memory quit UNIT [--force] [--yes] [--json]
+  omarchy-cleaner memory kill PID [--force] [--yes] [--json]
   omarchy-cleaner status [--json]
   omarchy-cleaner modules [--json]
   omarchy-cleaner tasks [--json]
@@ -42,6 +47,7 @@ Global options:
   --json     Machine-readable output on stdout (for scripts, agents, the panel)
   --quiet    No progress messages on stderr
   --yes      Do not ask for confirmation (required without a terminal)
+  --force    memory quit/kill: SIGKILL instead of a clean SIGTERM
 
 Modules: $(oc_module_ids | paste -sd' ')
 Tasks:   $(for t in "${OC_TASKS[@]}"; do printf '%s ' "${t%%|*}"; done)
@@ -59,6 +65,8 @@ OC_DETAILS=0
 OC_NOTIFY=0
 OC_DEFAULTS=0
 OC_HISTORY_N=20
+OC_FORCE=0
+OC_LIMIT_SET=0
 POSITIONAL=()
 
 parse_flags() {
@@ -71,7 +79,8 @@ parse_flags() {
       --details) OC_DETAILS=1 ;;
       --notify) OC_NOTIFY=1 ;;
       --defaults) OC_DEFAULTS=1 ;;
-      --limit) OC_HISTORY_N=${2:?--limit needs a number}; shift ;;
+      --force | -f) OC_FORCE=1 ;;
+      --limit) OC_HISTORY_N=${2:?--limit needs a number}; OC_LIMIT_SET=1; shift ;;
       -h | --help) usage; exit 0 ;;
       --) shift; POSITIONAL+=("$@"); break ;;
       -*) oc_die "unknown option: $1" 2 ;;
@@ -650,6 +659,56 @@ cmd_trash() {
   ((failed == 0)) || exit 4
 }
 
+# Memory: RAM/swap, memory per application, stuck processes, quit actions.
+cmd_memory() {
+  local action=${POSITIONAL[0]:-show} target=${POSITIONAL[1]:-} limit=10 result
+  ((OC_LIMIT_SET == 1)) && limit=$OC_HISTORY_N
+  [[ $limit =~ ^[0-9]+$ ]] || oc_die "--limit must be a number" 2
+  case "$action" in
+    show)
+      result=$(oc_memory_json "$limit")
+      if [[ $OC_JSON == 1 ]]; then
+        echo "$result"
+        return 0
+      fi
+      jq -r '"RAM   \(.ram.usedBytes) / \(.ram.totalBytes)   available \(.ram.availableBytes)   file cache \(.ram.cacheBytes)",
+             "Swap  \(.swap.usedBytes) / \(.swap.totalBytes)"' <<<"$result" |
+        while read -r label a _ b rest; do
+          # Re-format the byte counts produced above.
+          if [[ $label == RAM ]]; then
+            read -r _ avail _ _ cache <<<"$rest"
+            printf 'RAM   %s / %s   available %s   file cache %s\n' "$(oc_human "$a")" "$(oc_human "$b")" "$(oc_human "$avail")" "$(oc_human "$cache")"
+          else
+            printf 'Swap  %s / %s\n' "$(oc_human "$a")" "$(oc_human "$b")"
+          fi
+        done
+      printf '\n'
+      jq -r '.apps[] | [.name, (.bytes | tostring), (.processCount | tostring), (if .quittable then .unit else "(" + .reason + ")" end)] | join("\t")' <<<"$result" |
+        while IFS=$'\t' read -r name bytes count unit; do
+          printf '  %-24s %10s  %3s proc  %s\n' "${name:0:24}" "$(oc_human "$bytes")" "$count" "$unit"
+        done
+      if [[ $(jq '.stuck | length' <<<"$result") -gt 0 ]]; then
+        printf '\nStuck processes:\n'
+        jq -r '.stuck[] | "  \(.pid)  \(.comm)  \(.stateLabel)"' <<<"$result"
+      fi
+      printf '\nQuit an app: omarchy-cleaner memory quit UNIT   ·   a process: omarchy-cleaner memory kill PID\n'
+      ;;
+    quit)
+      [[ -n $target ]] || oc_die "usage: omarchy-cleaner memory quit UNIT [--force]" 2
+      oc_confirm "$([[ $OC_FORCE == 1 ]] && echo "Force quit" || echo "Quit") $target? Unsaved work may be lost." || oc_die "cancelled" 3
+      result=$(oc_memory_quit_unit "$target" "$OC_FORCE")
+      if [[ $OC_JSON == 1 ]]; then echo "$result"; else oc_info "sent $(jq -r .signal <<<"$result") to $(jq -r .name <<<"$result")"; fi
+      ;;
+    kill)
+      [[ -n $target ]] || oc_die "usage: omarchy-cleaner memory kill PID [--force]" 2
+      oc_confirm "$([[ $OC_FORCE == 1 ]] && echo "Force quit" || echo "Quit") process $target? Unsaved work may be lost." || oc_die "cancelled" 3
+      result=$(oc_memory_kill_pid "$target" "$OC_FORCE")
+      if [[ $OC_JSON == 1 ]]; then echo "$result"; else oc_info "sent $(jq -r .signal <<<"$result") to $(jq -r .comm <<<"$result") ($target)"; fi
+      ;;
+    *) oc_die "usage: omarchy-cleaner memory [quit UNIT | kill PID]" 2 ;;
+  esac
+}
+
 # Opt-in: expose the CLI on PATH via ~/.local/bin (never overwrites a real file).
 cmd_link() {
   local target="$HOME/.local/bin/omarchy-cleaner"
@@ -680,7 +739,7 @@ cmd_open() {
 
 # ---------------------------------------------------------------------------
 main() {
-  oc_require jq du find numfmt
+  oc_require jq gawk du find numfmt
   local cmd=${1:-help}
   (($# > 0)) && shift
   parse_flags "$@"
@@ -696,6 +755,7 @@ main() {
     schedule) cmd_schedule ;;
     history) cmd_history ;;
     trash) cmd_trash ;;
+    memory) cmd_memory ;;
     link) cmd_link ;;
     unlink) cmd_unlink ;;
     open) cmd_open ;;

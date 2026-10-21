@@ -105,6 +105,7 @@ Only one `clean` runs at a time. A concurrent run exits with code 1.
 | `dns-flush` | 🔒 | `resolvectl flush-caches` |
 | `trim` | 🔒 | `fstrim --all --verbose` |
 | `locate-db` | 🔒 | `updatedb` |
+| `drop-caches` | 🔒 | `sync; echo 3 > /proc/sys/vm/drop_caches`. Rarely useful, see README |
 
 ```json
 { "ok": true, "tasks": [ { "verb": "font-cache", "ok": true, "message": "" } ] }
@@ -115,6 +116,64 @@ Only one `clean` runs at a time. A concurrent run exits with code 1.
 Moves files or folders to the freedesktop Trash. This is how the panel removes
 a single large file. Paths outside `$HOME` (or a mounted drive's own trash) and
 ignored paths are refused.
+
+### `memory [--limit N] [--json]`
+
+Shows RAM, swap and memory per application. It is read-only and fast (about
+0.4 s), so the panel polls it every 3 seconds while the Memory tab is open.
+
+- Memory is **PSS** from `/proc/PID/smaps_rollup`, summed per systemd unit
+  (cgroup). Only your own processes are readable and listed.
+- `cacheBytes` is the reclaimable file cache. `usedBytes` is
+  `total - available`, so it does not include that cache.
+- `--limit` caps the number of apps (default 10). `appsTotal` gives the full count.
+
+```json
+{
+  "ok": true,
+  "generatedAt": "2026-10-21T10:59:40Z",
+  "ram":  { "totalBytes": 33312813056, "usedBytes": 22333272064, "availableBytes": 10979540992,
+            "freeBytes": 2112241664, "cacheBytes": 10880188416 },
+  "swap": { "totalBytes": 66624573440, "usedBytes": 9826095104 },
+  "appsTotal": 37,
+  "apps": [
+    {
+      "unit": "app-zcode-404517.scope",
+      "name": "zcode",
+      "mainProcess": "ZCode",            // heaviest process of the group
+      "bytes": 1636000000,
+      "processCount": 25,
+      "quittable": true,
+      "reason": "",                      // why it cannot be quit, when it cannot
+      "processes": [ { "pid": 4242, "comm": "ZCode", "bytes": 900000000, "quittable": true } ]
+    }
+  ],
+  "stuck": [
+    { "pid": 1408, "comm": "uwsm-app", "state": "Z", "canKill": false,
+      "stateLabel": "zombie (already exited, waiting for its parent)" }
+  ]
+}
+```
+
+`quittable` is false for session and system services, for the desktop
+components listed in `lib/memory.sh` (`OC_PROTECTED_PROCESSES`), and for the
+terminal running the CLI.
+
+### `memory quit UNIT [--force] [--yes] [--json]`
+
+Sends SIGTERM (or SIGKILL with `--force`) to every process of an application
+unit through `systemctl --user kill`. `UNIT` must be an `app-*.scope` or
+`app-*.service` that `memory` currently lists as quittable. Anything else is
+refused: exit 2 for a non-app unit, 1 for a protected one.
+
+```json
+{ "ok": true, "unit": "app-zcode-404517.scope", "name": "zcode", "signal": "SIGTERM", "bytes": 1636000000 }
+```
+
+### `memory kill PID [--force] [--yes] [--json]`
+
+Sends SIGTERM (or SIGKILL) to one process you own. Refuses other users'
+processes, desktop components and the CLI itself.
 
 ### `status [--json]`
 
@@ -168,6 +227,7 @@ When the widget is enabled, the shell exposes the target
 | Method | Returns | Effect |
 |---|---|---|
 | `open`, `close`, `toggle` (`show`, `hide`) | — | panel visibility |
+| `showDisk`, `showMemory` | — | open the panel on that tab |
 | `scan` | — | background scan; the widget updates when it finishes |
 | `cleanDefaults` | — | cleans the pre-selected modules (password prompt for root items) |
 | `status` | JSON string | `busy`, `status`, `error`, `generatedAt`, `totalBytes`, `selectedBytes` |

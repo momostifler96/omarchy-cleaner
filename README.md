@@ -1,6 +1,6 @@
 # Omarchy Cleaner
 
-Find and reclaim disk space on [Omarchy](https://omarchy.org). Omarchy Cleaner checks app caches, the pacman cache, system logs, crash dumps, Trash, developer caches, Docker leftovers and large files, then removes what you select. It adds a bar widget with a panel to the Omarchy shell. Under the panel is a scriptable CLI that you, your scripts or an AI agent can drive.
+Find and reclaim disk space and memory on [Omarchy](https://omarchy.org). Omarchy Cleaner checks app caches, the pacman cache, system logs, crash dumps, Trash, developer caches, Docker leftovers and large files, then removes what you select. A **Memory** tab shows what really uses your RAM, application by application, and lets you quit it cleanly. It adds a bar widget with a panel to the Omarchy shell. Under the panel is a scriptable CLI that you, your scripts or an AI agent can drive.
 
 ![Omarchy Cleaner panel](preview.png)
 
@@ -17,9 +17,10 @@ Omarchy Cleaner targets **Omarchy 4 (Quattro shell)** or later. Everything it ne
 
 | Required | Package | Used for |
 |---|---|---|
-| `bash` ≥ 5, `jq` | bash, jq | the CLI and its JSON output |
+| `bash` ≥ 5, `jq`, `gawk` | bash, jq, gawk | the CLI, its JSON output, the memory view |
 | `du`, `find`, `numfmt`, `flock`, `column` | coreutils, findutils, util-linux | scanning, sizes, locking |
 | `pkexec` | polkit | the privileged helper (system items only) |
+| `systemctl --user` | systemd | quitting applications from the Memory tab |
 | `paccache` | pacman-contrib | the **Package cache** module |
 
 | Optional | Package | Enables |
@@ -85,6 +86,17 @@ rm -rf ~/.config/omarchy-cleaner ~/.local/state/omarchy-cleaner
 - **Large files** is review-only: expand it to open the containing folder or move a single file to Trash.
 - The **Maintenance** buttons run one-off tasks.
 
+**Memory tab.**
+- Shows RAM and swap usage, plus the file cache. Linux gives that cache back instantly when an app needs it, so it is not wasted memory.
+- Lists your applications by real memory use (PSS: shared memory is split fairly, not counted twice).
+  - Each app launched from Omarchy is one entry, with all its helper processes.
+  - Commands started from a terminal belong to that terminal's entry. Click it to see them and quit one at a time.
+- ✕ quits an app cleanly (SIGTERM, so it can save and exit). ⚡ force-quits it (SIGKILL). Both ask for confirmation.
+- The desktop session (Hyprland, the Omarchy shell, portals, audio…) is never offered for quitting.
+- **Stuck processes** lists stopped processes, which can be force-quit, plus zombie and disk-wait processes, explained since no signal removes them.
+
+> **Why there is no "Free RAM" button.** The equivalent on Linux is dropping the kernel file cache. It only makes the "free" number look better for a few minutes, while the system re-reads files from disk. It is available under Maintenance → **Drop file cache** for completeness, behind a warning. Quitting what uses memory is what actually frees it.
+
 **Widget settings** (Bar settings, or inline in `~/.config/omarchy/shell.json`):
 
 | Key | Default | Meaning |
@@ -132,15 +144,19 @@ omarchy-cleaner clean user-cache trash --yes --json  # clean named modules
 omarchy-cleaner clean --defaults --dry-run --json    # preview the pre-selection
 omarchy-cleaner maintain font-cache desktop-db --yes # maintenance tasks
 omarchy-cleaner status --json                        # last scan summary (cheap)
+omarchy-cleaner memory --json                        # RAM, swap, apps by memory, stuck processes
+omarchy-cleaner memory quit UNIT --yes               # quit an app cleanly (--force for SIGKILL)
+omarchy-cleaner memory kill PID --yes                # quit one process
 ```
 
-Without a terminal, `clean`, `maintain` and `trash` refuse to run unless you pass `--yes` (exit code 3). This is deliberate for scripts and agents.
+Without a terminal, `clean`, `maintain`, `trash` and `memory quit/kill` refuse to run unless you pass `--yes` (exit code 3). This is deliberate for scripts and agents.
 
 **Shell IPC** (through the running Omarchy shell):
 
 ```bash
 T=io.github.momostifler96.omarchy-cleaner
 omarchy-shell $T toggle          # open / close the panel (also: open, close)
+omarchy-shell $T showMemory      # open on the Memory tab (showDisk for the Disk tab)
 omarchy-shell $T scan            # rescan in the background
 omarchy-shell $T cleanDefaults   # clean the pre-selected modules
 omarchy-shell $T status          # JSON: busy, status, sizes, last scan
@@ -171,7 +187,8 @@ The config file is optional and only written by `omarchy-cleaner config set` and
 Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling, as with any plugin. Specifically:
 
 - The QML runs only the bundled `bin/omarchy-cleaner` and `xdg-open`. It makes no network calls.
-- `bin/omarchy-cleaner-root` is the only code that runs as root. It runs through `pkexec`, so every use needs your password, and it accepts only these verbs: `pacman-cache N`, `journal N`, `coredumps`, `orphans`, `snapper`, `dns-flush`, `trim`, `locate-db`. Each verb maps to one fixed command, listed at the top of the file.
+- `bin/omarchy-cleaner-root` is the only code that runs as root. It runs through `pkexec`, so every use needs your password, and it accepts only these verbs: `pacman-cache N`, `journal N`, `coredumps`, `orphans`, `snapper`, `dns-flush`, `trim`, `locate-db`, `drop-caches`. Each verb maps to one fixed command, listed at the top of the file.
+- The Memory tab can only signal processes you own. It refuses the desktop session components and the terminal the CLI runs in, and it always asks before quitting.
 - Installing the plugin runs nothing. It never edits `shell.json`, Hyprland or any other configuration.
 
 ## Troubleshooting
