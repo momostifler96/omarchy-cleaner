@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.momostifler96.omarchy-cleaner",
+  "name": "Omarchy Cleaner",
+  "version": "0.1.0",
+  "author": "momoledev",
+  "description": "Find and reclaim disk space: caches, package cache, logs, crash dumps, trash, dev caches, Docker leftovers and large files. Bar widget + scriptable CLI.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Cleaner",
+    "description": "Shows reclaimable disk space and opens the cleaner panel",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showSize": false,
+      "autoScanHours": 6
+    },
+    "schema": [
+      { "key": "showSize", "type": "bool", "label": "Show reclaimable size next to the icon" },
+      { "key": "autoScanHours", "type": "number", "label": "Background scan interval in hours (0 = off)" }
+    ]
+  }
+}

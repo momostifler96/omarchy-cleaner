@@ -1,0 +1,5 @@
+source-path=SCRIPTDIR
+source-path=SCRIPTDIR/..
+external-sources=true
+# Test assertions intentionally use "cond && ok || ko".
+disable=SC2015

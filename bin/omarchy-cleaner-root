@@ -1,0 +1,118 @@
+#!/bin/bash
+#
+# omarchy-cleaner-root — privileged helper for omarchy-cleaner.
+#
+# Runs through pkexec, so every invocation asks for your password via the
+# Omarchy polkit agent. It accepts ONLY the fixed verbs below; it never takes
+# file paths or shell snippets from the caller, which keeps the root surface
+# small and auditable.
+#
+#   pacman-cache <keep>   paccache -rk<keep> then paccache -ruk0
+#   journal <max-MB>      journalctl --vacuum-size=<max-MB>M
+#   coredumps             delete /var/lib/systemd/coredump/core.*
+#   orphans               pacman -Rns the packages listed by pacman -Qdtq
+#   snapper               snapper -c root cleanup number
+#   dns-flush             resolvectl flush-caches
+#   trim                  fstrim --all --verbose
+#   locate-db             updatedb
+#
+# Usage: pkexec omarchy-cleaner-root <verb> [arg] [<verb> [arg] ...]
+# Output: one JSON object per verb on stdout: {"verb":…,"ok":…,"message":…}
+
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin
+export LC_ALL=C
+
+if [[ $EUID -ne 0 ]]; then
+  echo "omarchy-cleaner-root: must run as root (use pkexec)" >&2
+  exit 1
+fi
+
+result() {
+  # $1 verb, $2 ok (true/false), $3 message
+  printf '{"verb":"%s","ok":%s,"message":"%s"}\n' "$1" "$2" "$(printf '%s' "$3" | tr -d '"\\' | tr '\000-\037' ' ' | cut -c1-400)"
+}
+
+number_arg() {
+  # Validate a small positive integer argument.
+  [[ ${1:-} =~ ^[0-9]{1,6}$ ]] || { echo "omarchy-cleaner-root: invalid number '${1:-}'" >&2; exit 2; }
+}
+
+run_verb() {
+  local verb=$1 out status=0
+  shift
+  case "$verb" in
+    pacman-cache)
+      out=$({ paccache -rk"$1" && paccache -ruk0; } 2>&1) || status=$?
+      ;;
+    journal)
+      out=$(journalctl --vacuum-size="$1"M 2>&1) || status=$?
+      ;;
+    coredumps)
+      out=$(find /var/lib/systemd/coredump -maxdepth 1 -type f -name 'core.*' -delete -print 2>&1 | wc -l)
+      out="removed $out file(s)"
+      ;;
+    orphans)
+      local -a pkgs
+      mapfile -t pkgs < <(pacman -Qdtq 2>/dev/null || true)
+      if ((${#pkgs[@]} == 0)); then
+        out="no orphan packages"
+      else
+        out=$(pacman -Rns --noconfirm "${pkgs[@]}" 2>&1) || status=$?
+      fi
+      ;;
+    snapper)
+      out=$(snapper -c root cleanup number 2>&1) || status=$?
+      ;;
+    dns-flush)
+      out=$(resolvectl flush-caches 2>&1) || status=$?
+      ;;
+    trim)
+      out=$(fstrim --all --verbose 2>&1) || status=$?
+      ;;
+    locate-db)
+      out=$(updatedb 2>&1) || status=$?
+      ;;
+  esac
+  if ((status == 0)); then
+    result "$verb" true "${out:-done}"
+  else
+    result "$verb" false "${out:-failed with status $status}"
+  fi
+  return 0
+}
+
+(($# > 0)) || { echo "usage: omarchy-cleaner-root <verb> [arg] ..." >&2; exit 2; }
+
+# Validate the whole command line before running anything.
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+  case "${args[i]}" in
+    pacman-cache | journal)
+      number_arg "${args[i + 1]:-}"
+      i=$((i + 2))
+      ;;
+    coredumps | orphans | snapper | dns-flush | trim | locate-db)
+      i=$((i + 1))
+      ;;
+    *)
+      echo "omarchy-cleaner-root: unknown verb '${args[i]}'" >&2
+      exit 2
+      ;;
+  esac
+done
+
+i=0
+while ((i < ${#args[@]})); do
+  case "${args[i]}" in
+    pacman-cache | journal)
+      run_verb "${args[i]}" "${args[i + 1]}"
+      i=$((i + 2))
+      ;;
+    *)
+      run_verb "${args[i]}"
+      i=$((i + 1))
+      ;;
+  esac
+done

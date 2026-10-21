@@ -1,0 +1,708 @@
+#!/bin/bash
+#
+# omarchy-cleaner — scan and reclaim disk space on Omarchy.
+#
+# This CLI is the single backend for everything: the bar widget and panel call
+# it with --json, scripts and AI agents can drive it the same way, and the
+# optional systemd timer runs `scan --notify`. See `omarchy-cleaner help` and
+# docs/CLI.md for the full reference.
+
+set -euo pipefail
+
+OC_ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$OC_ROOT/lib/common.sh"
+# shellcheck source=lib/modules.sh
+source "$OC_ROOT/lib/modules.sh"
+
+OC_HELPER="$OC_ROOT/bin/omarchy-cleaner-root"
+OC_VERSION=$(jq -r '.version' "$OC_ROOT/manifest.json" 2>/dev/null || echo unknown)
+OC_PLUGIN_ID=$(jq -r '.id' "$OC_ROOT/manifest.json" 2>/dev/null || echo omarchy-cleaner)
+
+usage() {
+  cat <<EOF
+omarchy-cleaner $OC_VERSION — reclaim disk space on Omarchy
+
+Usage:
+  omarchy-cleaner scan [MODULE...] [--details] [--notify] [--json]
+  omarchy-cleaner clean (MODULE... | --defaults) [--dry-run] [--yes] [--json]
+  omarchy-cleaner maintain TASK... [--yes] [--json]
+  omarchy-cleaner trash PATH... [--yes] [--json]
+  omarchy-cleaner status [--json]
+  omarchy-cleaner modules [--json]
+  omarchy-cleaner tasks [--json]
+  omarchy-cleaner ignore (list | add PATH | remove PATH)
+  omarchy-cleaner config (list | get KEY | set KEY VALUE | unset KEY)
+  omarchy-cleaner schedule (enable [daily|weekly|monthly] | disable | status)
+  omarchy-cleaner history [--limit N] [--json]
+  omarchy-cleaner link | unlink
+  omarchy-cleaner open | version | help
+
+Global options:
+  --json     Machine-readable output on stdout (for scripts, agents, the panel)
+  --quiet    No progress messages on stderr
+  --yes      Do not ask for confirmation (required without a terminal)
+
+Modules: $(oc_module_ids | paste -sd' ')
+Tasks:   $(for t in "${OC_TASKS[@]}"; do printf '%s ' "${t%%|*}"; done)
+
+Exit codes: 0 ok · 1 error · 2 usage · 3 confirmation required · 4 partial failure
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing shared by every command.
+# ---------------------------------------------------------------------------
+OC_YES=0
+OC_DRY_RUN=0
+OC_DETAILS=0
+OC_NOTIFY=0
+OC_DEFAULTS=0
+OC_HISTORY_N=20
+POSITIONAL=()
+
+parse_flags() {
+  while (($# > 0)); do
+    case "$1" in
+      --json) OC_JSON=1 ;;
+      --quiet | -q) OC_QUIET=1 ;;
+      --yes | -y) OC_YES=1 ;;
+      --dry-run | -n) OC_DRY_RUN=1 ;;
+      --details) OC_DETAILS=1 ;;
+      --notify) OC_NOTIFY=1 ;;
+      --defaults) OC_DEFAULTS=1 ;;
+      --limit) OC_HISTORY_N=${2:?--limit needs a number}; shift ;;
+      -h | --help) usage; exit 0 ;;
+      --) shift; POSITIONAL+=("$@"); break ;;
+      -*) oc_die "unknown option: $1" 2 ;;
+      *) POSITIONAL+=("$1") ;;
+    esac
+    shift
+  done
+}
+
+validate_modules() {
+  local id
+  for id in "$@"; do
+    oc_module_line "$id" >/dev/null || oc_die "unknown module: $id (see 'omarchy-cleaner modules')" 2
+  done
+}
+
+# Modules pre-selected for `--defaults`: the user's saved selection when it
+# exists (config key "selection"), otherwise each module's default flag.
+default_selection() {
+  local saved
+  saved=$(jq -r '.selection // empty | .[]' "$OC_CONFIG_FILE" 2>/dev/null || true)
+  if [[ -n $saved ]]; then
+    echo "$saved"
+    return
+  fi
+  local line
+  for line in "${OC_MODULES[@]}"; do
+    if [[ $(cut -d'|' -f5 <<<"$line") == 1 ]]; then echo "${line%%|*}"; fi
+  done
+  return 0
+}
+
+is_selected() {
+  local selection
+  selection=$(default_selection)
+  grep -qx -- "$1" <<<"$selection"
+}
+
+# ---------------------------------------------------------------------------
+# scan
+# ---------------------------------------------------------------------------
+
+# Prints one module's scan result as a compact JSON object.
+scan_module_json() {
+  local id=$1 title desc kind def risk mode reason="" items="" available=true selected=false
+  IFS='|' read -r _ title desc kind def risk mode <<<"$(oc_module_line "$id")"
+  if ! reason=$(oc_module_available "$id"); then
+    available=false
+  else
+    reason=""
+    items=$(oc_module_scan "$id" 2>/dev/null || true)
+  fi
+  is_selected "$id" && selected=true
+  jq -cn \
+    --arg id "$id" --arg title "$title" --arg description "$desc" \
+    --arg kind "$kind" --arg risk "$risk" --arg mode "$mode" \
+    --arg reason "$reason" --arg items "$items" \
+    --argjson available "$available" --argjson selected "$selected" \
+    --argjson details "$OC_DETAILS" '
+    ($items | split("\n") | map(select(length > 0) | split("\t")
+      | {bytes: (.[0] | tonumber), path: .[1], label: (.[2] // "")})
+      | sort_by(-.bytes)) as $all
+    | {
+        id: $id, title: $title, description: $description,
+        kind: $kind, requiresRoot: ($kind == "root"), risk: $risk, mode: $mode,
+        available: $available, reason: $reason, selected: $selected,
+        bytes: ($all | map(.bytes) | add // 0),
+        count: ($all | length),
+        items: (if $details == 1 then $all else $all[:5] end)
+      }'
+}
+
+cmd_scan() {
+  local -a ids=("${POSITIONAL[@]}")
+  ((${#ids[@]} > 0)) || mapfile -t ids < <(oc_module_ids)
+  validate_modules "${ids[@]}"
+
+  local modules="" id json
+  for id in "${ids[@]}"; do
+    oc_step "Scanning $(oc_module_field "$id" 2)…"
+    json=$(scan_module_json "$id")
+    modules+="$json"$'\n'
+  done
+
+  local result
+  result=$(jq -cs --arg version "$OC_VERSION" --arg at "$(date -Iseconds)" '{
+      ok: true, version: $version, generatedAt: $at,
+      totalBytes: (map(select(.available) | .bytes) | add // 0),
+      selectedBytes: (map(select(.available and .selected) | .bytes) | add // 0),
+      modules: .
+    }' <<<"$modules")
+
+  # A full scan becomes the bar widget's state; a partial scan is merged into it.
+  if ((${#POSITIONAL[@]} == 0)); then
+    oc_state_write <<<"$result"
+  else
+    merge_into_last_scan "$result"
+  fi
+
+  ((OC_NOTIFY == 1)) && notify_if_needed "$result"
+
+  if [[ $OC_JSON == 1 ]]; then
+    echo "$result"
+  else
+    print_scan_human "$result"
+  fi
+}
+
+merge_into_last_scan() {
+  local partial=$1 merged
+  [[ -f $OC_LAST_SCAN ]] || return 0
+  merged=$(jq -c --argjson p "$partial" '
+      ($p.modules | map({key: .id, value: .}) | from_entries) as $new
+      | .modules |= map($new[.id] // .)
+      | .generatedAt = $p.generatedAt
+      | .totalBytes = (.modules | map(select(.available) | .bytes) | add // 0)
+      | .selectedBytes = (.modules | map(select(.available and .selected) | .bytes) | add // 0)
+    ' "$OC_LAST_SCAN" 2>/dev/null) || return 0
+  oc_state_write <<<"$merged"
+}
+
+print_scan_human() {
+  local result=$1
+  printf '\n'
+  jq -r '.modules[] | [
+      (if .selected then "[x]" else "[ ]" end), .id, .title,
+      (if .available then (.bytes | tostring) else "-" end),
+      (.count | tostring), .risk, (if .requiresRoot then "root" else "" end),
+      (if .available then "" else .reason end)
+    ] | @tsv' <<<"$result" |
+    while IFS=$'\t' read -r sel id title bytes count risk root reason; do
+      if [[ $bytes == - ]]; then
+        printf '  %s %-18s %-30s %10s  %s\n' "$sel" "$id" "$title" "n/a" "$reason"
+      else
+        printf '  %s %-18s %-30s %10s  %4s item(s)  %-6s %s\n' "$sel" "$id" "$title" "$(oc_human "$bytes")" "$count" "$risk" "$root"
+      fi
+    done
+  printf '\n  Total found: %s   ·   Pre-selected: %s\n' \
+    "$(oc_human "$(jq -r .totalBytes <<<"$result")")" \
+    "$(oc_human "$(jq -r .selectedBytes <<<"$result")")"
+  printf '  Clean the pre-selected modules with: omarchy-cleaner clean --defaults\n\n'
+}
+
+notify_if_needed() {
+  local result=$1 threshold bytes
+  threshold=$(($(oc_config_get notifyThresholdMB 1024) * 1048576))
+  bytes=$(jq -r .selectedBytes <<<"$result")
+  ((bytes >= threshold)) || return 0
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a "Omarchy Cleaner" -i user-trash-full \
+    "$(oc_human "$bytes") can be freed" \
+    "Open the cleaner from the bar, or run: omarchy-cleaner clean --defaults" || true
+}
+
+# ---------------------------------------------------------------------------
+# clean
+# ---------------------------------------------------------------------------
+cmd_clean() {
+  local -a ids=("${POSITIONAL[@]}")
+  if ((OC_DEFAULTS == 1)); then
+    mapfile -t ids < <(default_selection)
+  fi
+  ((${#ids[@]} > 0)) || oc_die "nothing to clean: name modules or pass --defaults" 2
+  validate_modules "${ids[@]}"
+
+  # One clean at a time (panel, timer and terminal may race).
+  exec 9>"$OC_LOCK_FILE"
+  flock -n 9 || oc_die "another omarchy-cleaner clean is already running" 1
+
+  # Fresh scan of the requested modules.
+  local -A items_of=() bytes_of=()
+  local id plan_total=0 items
+  for id in "${ids[@]}"; do
+    if ! oc_module_available "$id" >/dev/null; then
+      oc_warn "skipping $id: $(oc_module_available "$id" || true)"
+      continue
+    fi
+    oc_step "Scanning $(oc_module_field "$id" 2)…"
+    items=$(oc_module_scan "$id" 2>/dev/null || true)
+    items_of[$id]=$items
+    bytes_of[$id]=$(awk -F'\t' '{s+=$1} END {print s+0}' <<<"$items")
+    plan_total=$((plan_total + bytes_of[$id]))
+  done
+
+  if ((OC_DRY_RUN == 1)); then
+    local out=""
+    for id in "${!items_of[@]}"; do
+      out+=$(jq -cn --arg id "$id" --arg items "${items_of[$id]}" --arg mode "$(oc_module_field "$id" 7)" '
+        {id: $id, mode: $mode,
+         items: ($items | split("\n") | map(select(length > 0) | split("\t")
+           | {bytes: (.[0] | tonumber), path: .[1], label: (.[2] // "")}))}
+        | .bytes = (.items | map(.bytes) | add // 0)')$'\n'
+    done
+    local result
+    result=$(jq -cs '{ok: true, dryRun: true, plannedBytes: (map(.bytes) | add // 0), modules: .}' <<<"$out")
+    if [[ $OC_JSON == 1 ]]; then echo "$result"; else
+      jq -r '.modules[] | "\(.id)\t\(.mode)\t\(.bytes)\t\(.items | length)"' <<<"$result" |
+        while IFS=$'\t' read -r id mode bytes n; do
+          printf '  would clean %-18s %10s  (%s item(s), %s)\n' "$id" "$(oc_human "$bytes")" "$n" "$mode"
+        done
+      printf '  Total: %s (dry run, nothing changed)\n' "$(oc_human "$plan_total")"
+    fi
+    return 0
+  fi
+
+  local item_count=0
+  for id in "${!items_of[@]}"; do
+    [[ -n ${items_of[$id]} ]] && item_count=$((item_count + $(grep -c . <<<"${items_of[$id]}")))
+  done
+  if ((item_count == 0)); then
+    oc_info "nothing to clean"
+    [[ $OC_JSON == 1 ]] && jq -cn '{ok: true, dryRun: false, freedBytes: 0, modules: []}'
+    return 0
+  fi
+  # Drop modules with nothing to do so they are not reported as cleaned.
+  for id in "${!items_of[@]}"; do
+    [[ -n ${items_of[$id]} ]] || unset "items_of[$id]"
+  done
+  oc_confirm "Clean ${#items_of[@]} module(s), about $(oc_human "$plan_total")?" || oc_die "cancelled" 3
+
+  local results="" root_verbs=() failed=0
+  local -A root_module_of=()
+  for id in "${!items_of[@]}"; do
+    local kind mode freed=0 errors=0
+    kind=$(oc_module_field "$id" 4)
+    mode=$(oc_module_field "$id" 7)
+    case "$kind" in
+      root)
+        local verb
+        verb=$("$(oc_fn oc_verbs "$id")")
+        # shellcheck disable=SC2206 # verbs are "name [number]"
+        root_verbs+=($verb)
+        root_module_of[${verb%% *}]=$id
+        continue
+        ;;
+      command)
+        oc_step "Cleaning $(oc_module_field "$id" 2)…"
+        if "$(oc_fn oc_clean "$id")"; then freed=${bytes_of[$id]}; else errors=1; fi
+        ;;
+      user)
+        if [[ $mode == report ]]; then
+          oc_warn "$id is review-only; move files individually with: omarchy-cleaner trash PATH"
+          results+=$(jq -cn --arg id "$id" '{id: $id, ok: true, freedBytes: 0, errors: 0, mode: "report", skipped: true}')$'\n'
+          continue
+        fi
+        oc_step "Cleaning $(oc_module_field "$id" 2)…"
+        local bytes path label
+        while IFS=$'\t' read -r bytes path _; do
+          [[ -n $path ]] || continue
+          case "$mode" in
+            contents) oc_empty_dir "$path" && freed=$((freed + bytes)) || errors=$((errors + 1)) ;;
+            delete) oc_delete "$path" && freed=$((freed + bytes)) || errors=$((errors + 1)) ;;
+            trash) oc_trash "$path" && freed=$((freed + bytes)) || errors=$((errors + 1)) ;;
+          esac
+        done <<<"${items_of[$id]}"
+        ;;
+    esac
+    ((errors > 0)) && failed=1
+    oc_info "$id: $(oc_human "$freed")$([[ $mode == trash ]] && echo ' moved to Trash')$( ((errors > 0)) && echo " ($errors error(s))")"
+    results+=$(jq -cn --arg id "$id" --argjson freed "$freed" --argjson errors "$errors" --arg mode "$mode" \
+      '{id: $id, ok: ($errors == 0), freedBytes: $freed, errors: $errors, mode: $mode}')$'\n'
+  done
+
+  if ((${#root_verbs[@]} > 0)); then
+    oc_step "Running privileged cleanup (authentication required)…"
+    local helper_out line verb ok msg
+    if helper_out=$(pkexec "$OC_HELPER" "${root_verbs[@]}" 2>&1); then :; else
+      oc_warn "privileged cleanup was not authorized or failed"
+    fi
+    for verb in "${!root_module_of[@]}"; do
+      id=${root_module_of[$verb]}
+      line=$(grep -F "\"verb\":\"$verb\"" <<<"$helper_out" | tail -n1 || true)
+      if [[ -n $line ]] && ok=$(jq -r .ok <<<"$line" 2>/dev/null) && [[ $ok == true ]]; then
+        oc_info "$id: about $(oc_human "${bytes_of[$id]}")"
+        results+=$(jq -cn --arg id "$id" --argjson freed "${bytes_of[$id]}" \
+          '{id: $id, ok: true, freedBytes: $freed, errors: 0, mode: "root", estimated: true}')$'\n'
+      else
+        msg=$([[ -n $line ]] && jq -r .message <<<"$line" 2>/dev/null || echo "not authorized")
+        oc_warn "$id: $msg"
+        failed=1
+        results+=$(jq -cn --arg id "$id" --arg msg "$msg" \
+          '{id: $id, ok: false, freedBytes: 0, errors: 1, mode: "root", message: $msg}')$'\n'
+      fi
+    done
+  fi
+
+  local result
+  result=$(jq -cs --arg at "$(date -Iseconds)" '{
+      ok: (all(.ok)), dryRun: false, finishedAt: $at,
+      freedBytes: (map(.freedBytes) | add // 0), modules: .
+    }' <<<"$results")
+  oc_history_append "$(jq -c '{at: .finishedAt, freedBytes, modules: [.modules[] | {id, ok, freedBytes}]}' <<<"$result")"
+
+  # Refresh the cached state for the cleaned modules (quietly).
+  (
+    OC_QUIET=1 OC_JSON=1 OC_NOTIFY=0 OC_DETAILS=0
+    POSITIONAL=("${!items_of[@]}")
+    cmd_scan >/dev/null 2>&1
+  ) || true
+
+  if [[ $OC_JSON == 1 ]]; then
+    echo "$result"
+  else
+    printf '\n  Freed about %s\n\n' "$(oc_human "$(jq -r .freedBytes <<<"$result")")"
+  fi
+  ((failed == 0)) || exit 4
+}
+
+# ---------------------------------------------------------------------------
+# maintain
+# ---------------------------------------------------------------------------
+cmd_maintain() {
+  ((${#POSITIONAL[@]} > 0)) || oc_die "name at least one task (see 'omarchy-cleaner tasks')" 2
+  local task line root_tasks=() results="" ok
+  for task in "${POSITIONAL[@]}"; do
+    oc_task_line "$task" >/dev/null || oc_die "unknown task: $task" 2
+  done
+  oc_confirm "Run ${#POSITIONAL[@]} maintenance task(s)?" || oc_die "cancelled" 3
+
+  for task in "${POSITIONAL[@]}"; do
+    line=$(oc_task_line "$task")
+    if [[ $(cut -d'|' -f4 <<<"$line") == root ]]; then
+      root_tasks+=("$task")
+      continue
+    fi
+    oc_step "$(cut -d'|' -f2 <<<"$line")…"
+    ok=true
+    case "$task" in
+      font-cache) fc-cache -f >/dev/null 2>&1 || ok=false ;;
+      desktop-db) update-desktop-database "$OC_DATA_HOME/applications" >/dev/null 2>&1 || ok=false ;;
+    esac
+    results+=$(jq -cn --arg verb "$task" --argjson ok "$ok" '{verb: $verb, ok: $ok, message: ""}')$'\n'
+  done
+
+  if ((${#root_tasks[@]} > 0)); then
+    oc_step "Running privileged tasks (authentication required)…"
+    local out
+    out=$(pkexec "$OC_HELPER" "${root_tasks[@]}" 2>/dev/null) || true
+    for task in "${root_tasks[@]}"; do
+      line=$(grep -F "\"verb\":\"$task\"" <<<"$out" | tail -n1 || true)
+      [[ -n $line ]] || line=$(jq -cn --arg verb "$task" '{verb: $verb, ok: false, message: "not authorized"}')
+      results+="$line"$'\n'
+    done
+  fi
+
+  local result
+  result=$(jq -cs '{ok: all(.ok), tasks: .}' <<<"$results")
+  if [[ $OC_JSON == 1 ]]; then echo "$result"; else
+    jq -r '.tasks[] | "  \(if .ok then "-" else "!" end) \(.verb) \(.message)"' <<<"$result" >&2
+  fi
+  [[ $(jq -r .ok <<<"$result") == true ]] || exit 4
+}
+
+# ---------------------------------------------------------------------------
+# Small commands
+# ---------------------------------------------------------------------------
+cmd_status() {
+  if [[ ! -f $OC_LAST_SCAN ]]; then
+    if [[ $OC_JSON == 1 ]]; then
+      jq -cn '{ok: true, scanned: false}'
+    else
+      echo "No scan yet. Run: omarchy-cleaner scan"
+    fi
+    return 0
+  fi
+  if [[ $OC_JSON == 1 ]]; then
+    jq -c '{ok: true, scanned: true, generatedAt, totalBytes, selectedBytes,
+            modules: [.modules[] | {id, title, bytes, selected, available}]}' "$OC_LAST_SCAN"
+  else
+    printf 'Last scan: %s\nFound: %s   Pre-selected: %s\n' \
+      "$(jq -r .generatedAt "$OC_LAST_SCAN")" \
+      "$(oc_human "$(jq -r .totalBytes "$OC_LAST_SCAN")")" \
+      "$(oc_human "$(jq -r .selectedBytes "$OC_LAST_SCAN")")"
+  fi
+}
+
+cmd_modules() {
+  local out="" line id title desc kind def risk mode
+  for line in "${OC_MODULES[@]}"; do
+    IFS='|' read -r id title desc kind def risk mode <<<"$line"
+    out+=$(jq -cn --arg id "$id" --arg title "$title" --arg description "$desc" --arg kind "$kind" \
+      --argjson default "$([[ $def == 1 ]] && echo true || echo false)" --arg risk "$risk" --arg mode "$mode" \
+      '{id: $id, title: $title, description: $description, kind: $kind, requiresRoot: ($kind == "root"),
+        default: $default, risk: $risk, mode: $mode}')$'\n'
+  done
+  if [[ $OC_JSON == 1 ]]; then jq -cs . <<<"$out"; else
+    jq -r '.[] | "  \(.id)\t\(.title)\t\(.risk)\(if .requiresRoot then " (root)" else "" end)\t\(.description)"' <<<"$(jq -cs . <<<"$out")" | column -t -s$'\t'
+  fi
+}
+
+cmd_tasks() {
+  local out="" line id title desc kind
+  for line in "${OC_TASKS[@]}"; do
+    IFS='|' read -r id title desc kind <<<"$line"
+    out+=$(jq -cn --arg id "$id" --arg title "$title" --arg description "$desc" --arg kind "$kind" \
+      '{id: $id, title: $title, description: $description, requiresRoot: ($kind == "root")}')$'\n'
+  done
+  if [[ $OC_JSON == 1 ]]; then jq -cs . <<<"$out"; else
+    jq -r '.[] | "  \(.id)\t\(.title)\(if .requiresRoot then " (root)" else "" end)\t\(.description)"' <<<"$(jq -cs . <<<"$out")" | column -t -s$'\t'
+  fi
+}
+
+cmd_ignore() {
+  local action=${POSITIONAL[0]:-list} path=${POSITIONAL[1]:-}
+  case "$action" in
+    list)
+      if [[ $OC_JSON == 1 ]]; then oc_ignore_list | jq -Rcs 'split("\n") | map(select(length > 0))'; else oc_ignore_list; fi
+      ;;
+    add | remove)
+      [[ -n $path ]] || oc_die "usage: omarchy-cleaner ignore $action PATH" 2
+      [[ $path == /* || $path == "~"* ]] || path="$(pwd)/$path"
+      path=${path/#\~/$HOME}
+      if [[ $action == add ]]; then
+        oc_config_write '.ignore = ((.ignore // []) + [$p] | unique)' --arg p "$path"
+      else
+        oc_config_write '.ignore = ((.ignore // []) - [$p])' --arg p "$path"
+      fi
+      oc_info "$action: $path"
+      [[ $OC_JSON == 1 ]] && jq -cn --arg p "$path" --arg a "$action" '{ok: true, action: $a, path: $p}'
+      ;;
+    *) oc_die "usage: omarchy-cleaner ignore (list | add PATH | remove PATH)" 2 ;;
+  esac
+  return 0
+}
+
+# Configuration keys and their types (documented in docs/CONFIG.md).
+OC_CONFIG_KEYS="pacmanKeep journalMaxMB largeFileMinMB notifyThresholdMB selection ignore"
+
+cmd_config() {
+  local action=${POSITIONAL[0]:-list} key=${POSITIONAL[1]:-} value=${POSITIONAL[2]:-}
+  case "$action" in
+    list)
+      if [[ -f $OC_CONFIG_FILE ]]; then jq -c . "$OC_CONFIG_FILE"; else echo '{}'; fi
+      ;;
+    get)
+      [[ -n $key ]] || oc_die "usage: omarchy-cleaner config get KEY" 2
+      oc_config_get "$key" ""
+      ;;
+    set)
+      [[ -n $key && -n $value ]] || oc_die "usage: omarchy-cleaner config set KEY VALUE" 2
+      [[ " $OC_CONFIG_KEYS " == *" $key "* ]] || oc_die "unknown config key: $key (known: $OC_CONFIG_KEYS)" 2
+      case "$key" in
+        selection | ignore)
+          jq -e 'type == "array"' <<<"$value" >/dev/null 2>&1 || oc_die "$key must be a JSON array, e.g. '[\"user-cache\",\"trash\"]'" 2
+          if [[ $key == selection ]]; then
+            local sel
+            for sel in $(jq -r '.[]' <<<"$value"); do validate_modules "$sel"; done
+          fi
+          oc_config_write '.[$k] = $v' --arg k "$key" --argjson v "$value"
+          ;;
+        *)
+          [[ $value =~ ^[0-9]+$ ]] || oc_die "$key must be a whole number" 2
+          oc_config_write '.[$k] = ($v | tonumber)' --arg k "$key" --arg v "$value"
+          ;;
+      esac
+      [[ $OC_JSON == 1 ]] && jq -c . "$OC_CONFIG_FILE"
+      ;;
+    unset)
+      [[ -n $key ]] || oc_die "usage: omarchy-cleaner config unset KEY" 2
+      [[ -f $OC_CONFIG_FILE ]] && oc_config_write 'del(.[$k])' --arg k "$key"
+      ;;
+    *) oc_die "usage: omarchy-cleaner config (list | get KEY | set KEY VALUE | unset KEY)" 2 ;;
+  esac
+  return 0
+}
+
+# Opt-in periodic scan via a systemd user timer. Only files created by this
+# command (marked with OC_UNIT_MARKER) are ever modified or removed.
+OC_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+OC_UNIT_NAME=omarchy-cleaner-scan
+OC_UNIT_MARKER="# Managed by omarchy-cleaner"
+
+cmd_schedule() {
+  local action=${POSITIONAL[0]:-status} period=${POSITIONAL[1]:-weekly}
+  local service="$OC_UNIT_DIR/$OC_UNIT_NAME.service" timer="$OC_UNIT_DIR/$OC_UNIT_NAME.timer"
+  case "$action" in
+    enable)
+      [[ $period =~ ^(daily|weekly|monthly)$ ]] || oc_die "period must be daily, weekly or monthly" 2
+      local f
+      for f in "$service" "$timer"; do
+        if [[ -e $f ]] && ! grep -qF "$OC_UNIT_MARKER" "$f"; then
+          oc_die "$f exists and was not created by omarchy-cleaner; refusing to overwrite it"
+        fi
+      done
+      mkdir -p "$OC_UNIT_DIR"
+      cat >"$service" <<EOF
+$OC_UNIT_MARKER
+[Unit]
+Description=Omarchy Cleaner periodic scan (notifies when space can be freed)
+
+[Service]
+Type=oneshot
+ExecStart=$OC_ROOT/bin/omarchy-cleaner scan --notify --quiet --json
+Nice=19
+IOSchedulingClass=idle
+EOF
+      cat >"$timer" <<EOF
+$OC_UNIT_MARKER
+[Unit]
+Description=Run the Omarchy Cleaner scan $period
+
+[Timer]
+OnCalendar=$period
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$OC_UNIT_NAME.timer" >/dev/null 2>&1 || oc_die "could not enable $OC_UNIT_NAME.timer"
+      oc_info "scheduled $period scan ($OC_UNIT_NAME.timer)"
+      ;;
+    disable)
+      systemctl --user disable --now "$OC_UNIT_NAME.timer" >/dev/null 2>&1 || true
+      local f
+      for f in "$service" "$timer"; do
+        [[ -f $f ]] && grep -qF "$OC_UNIT_MARKER" "$f" && rm -f "$f"
+      done
+      systemctl --user daemon-reload || true
+      oc_info "periodic scan disabled"
+      ;;
+    status) ;;
+    *) oc_die "usage: omarchy-cleaner schedule (enable [daily|weekly|monthly] | disable | status)" 2 ;;
+  esac
+  local enabled=false next=""
+  if systemctl --user is-enabled "$OC_UNIT_NAME.timer" >/dev/null 2>&1; then
+    enabled=true
+    next=$(systemctl --user show "$OC_UNIT_NAME.timer" -p NextElapseUSecRealtime --value 2>/dev/null || true)
+  fi
+  if [[ $OC_JSON == 1 ]]; then
+    jq -cn --argjson enabled "$enabled" --arg next "$next" '{ok: true, enabled: $enabled, next: $next}'
+  elif [[ $action == status ]]; then
+    if [[ $enabled == true ]]; then echo "Periodic scan: enabled (next: ${next:-unknown})"; else echo "Periodic scan: disabled"; fi
+  fi
+}
+
+cmd_history() {
+  [[ -f $OC_HISTORY ]] || { [[ $OC_JSON == 1 ]] && echo '[]'; return 0; }
+  [[ $OC_HISTORY_N =~ ^[0-9]+$ ]] || oc_die "--limit must be a number" 2
+  if [[ $OC_JSON == 1 ]]; then
+    tail -n "$OC_HISTORY_N" "$OC_HISTORY" | jq -cs .
+  else
+    tail -n "$OC_HISTORY_N" "$OC_HISTORY" | jq -r '"\(.at)  \(.freedBytes)  \([.modules[].id] | join(","))"' |
+      while read -r at bytes mods; do printf '%s  %10s  %s\n' "$at" "$(oc_human "$bytes")" "$mods"; done
+  fi
+}
+
+# Move individual files/folders to the Trash (used for review-only results such
+# as large files). The same guards as module cleaning apply.
+cmd_trash() {
+  ((${#POSITIONAL[@]} > 0)) || oc_die "usage: omarchy-cleaner trash PATH..." 2
+  local path results="" ok bytes failed=0
+  for path in "${POSITIONAL[@]}"; do
+    [[ $path == /* ]] || path="$(pwd)/$path"
+    [[ -e $path || -L $path ]] || oc_die "no such file: $path" 2
+    oc_path_allowed "$path" || oc_die "refusing to trash protected path: $path" 1
+  done
+  oc_confirm "Move ${#POSITIONAL[@]} item(s) to Trash?" || oc_die "cancelled" 3
+  for path in "${POSITIONAL[@]}"; do
+    [[ $path == /* ]] || path="$(pwd)/$path"
+    bytes=$(oc_path_bytes "$path")
+    ok=true
+    oc_trash "$path" || { ok=false; failed=1; }
+    [[ $ok == true ]] && oc_info "moved to Trash: $path"
+    results+=$(jq -cn --arg p "$path" --argjson ok "$ok" --argjson b "$bytes" '{path: $p, ok: $ok, bytes: $b}')$'\n'
+  done
+  oc_history_append "$(jq -cs --arg at "$(date -Iseconds)" '{at: $at, freedBytes: 0, trashedBytes: (map(select(.ok) | .bytes) | add // 0), modules: [{id: "trash-items", ok: all(.ok), freedBytes: 0}]}' <<<"$results")"
+  [[ $OC_JSON == 1 ]] && jq -cs '{ok: all(.ok), items: .}' <<<"$results"
+  # Keep the bar state in sync with what was just moved.
+  (
+    OC_QUIET=1 OC_JSON=1 OC_NOTIFY=0 OC_DETAILS=0
+    POSITIONAL=(large-files trash)
+    cmd_scan >/dev/null 2>&1
+  ) || true
+  ((failed == 0)) || exit 4
+}
+
+# Opt-in: expose the CLI on PATH via ~/.local/bin (never overwrites a real file).
+cmd_link() {
+  local target="$HOME/.local/bin/omarchy-cleaner"
+  if [[ -e $target && ! -L $target ]]; then
+    oc_die "$target exists and is not a link; refusing to replace it"
+  fi
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "$OC_ROOT/bin/omarchy-cleaner" "$target"
+  oc_info "linked $target → $OC_ROOT/bin/omarchy-cleaner"
+}
+
+cmd_unlink() {
+  local target="$HOME/.local/bin/omarchy-cleaner"
+  if [[ -L $target && $(readlink -f "$target") == "$OC_ROOT/bin/omarchy-cleaner" ]]; then
+    rm -f "$target"
+    oc_info "removed $target"
+  else
+    oc_info "nothing to unlink"
+  fi
+}
+
+# Open the panel in the running Omarchy shell.
+cmd_open() {
+  command -v omarchy-shell >/dev/null 2>&1 || oc_die "omarchy-shell not found"
+  omarchy-shell "$OC_PLUGIN_ID" open >/dev/null 2>&1 ||
+    oc_die "could not open the panel; is the widget enabled? (omarchy plugin enable $OC_PLUGIN_ID)"
+}
+
+# ---------------------------------------------------------------------------
+main() {
+  oc_require jq du find numfmt
+  local cmd=${1:-help}
+  (($# > 0)) && shift
+  parse_flags "$@"
+  case "$cmd" in
+    scan) cmd_scan ;;
+    clean) cmd_clean ;;
+    maintain) cmd_maintain ;;
+    status) cmd_status ;;
+    modules) cmd_modules ;;
+    tasks) cmd_tasks ;;
+    ignore) cmd_ignore ;;
+    config) cmd_config ;;
+    schedule) cmd_schedule ;;
+    history) cmd_history ;;
+    trash) cmd_trash ;;
+    link) cmd_link ;;
+    unlink) cmd_unlink ;;
+    open) cmd_open ;;
+    version | --version) if [[ $OC_JSON == 1 ]]; then jq -cn --arg v "$OC_VERSION" '{version: $v}'; else echo "$OC_VERSION"; fi ;;
+    help | -h | --help) usage ;;
+    *) oc_die "unknown command: $cmd (see 'omarchy-cleaner help')" 2 ;;
+  esac
+}
+
+main "$@"
